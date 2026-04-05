@@ -112,7 +112,8 @@ def check_new_items(params):
     new_cheap = []
     for item in items:
         item_id = item.get("id")
-        price = float(item.get("price", 9999))
+        price_raw = item.get("price", 9999)
+price = float(price_raw["amount"]) if isinstance(price_raw, dict) else float(price_raw)
         if item_id and item_id not in seen_ids and price <= MAX_PRICE:
             new_cheap.append(item)
         if item_id:
