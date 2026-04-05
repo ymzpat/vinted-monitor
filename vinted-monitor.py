@@ -8,8 +8,9 @@ WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 MAX_PRICE = float(os.environ.get("MAX_PRICE", 23))
 VINTED_USERNAME = os.environ["VINTED_USERNAME"]
 VINTED_PASSWORD = os.environ["VINTED_PASSWORD"]
-CHECK_INTERVAL = 60
+CHECK_INTERVAL = 20
 BELOW_MARKET_THRESHOLD = 0.80
+KEYWORDS = ["nike", "carhartt", "stussy", "arc'teryx"]
 
 SEARCH_URLS = []
 i = 1
@@ -101,19 +102,17 @@ def parse_params(url):
 
 
 def fetch_items(params):
-    try:
-        resp = session.get(VINTED_API, headers=HEADERS, params=params, timeout=10)
-        resp.raise_for_status()
-        return resp.json().get("items", [])
-    except requests.exceptions.HTTPError as e:
-        print(f"HTTP error: {e} — refreshing session")
-        get_session_cookie()
-        login()
-        return []
-    except Exception as e:
-        print(f"Fetch error: {e}")
-        return []
-
+    for attempt in range(3):
+        try:
+            resp = session.get(VINTED_API, headers=HEADERS, params=params, timeout=10)
+            resp.raise_for_status()
+            return resp.json().get("items", [])
+        except requests.exceptions.HTTPError:
+            print("Retrying...")
+            time.sleep(2 * (attempt + 1))
+            get_session_cookie()
+            login()
+    return []
 
 def fetch_item_details(item_id):
     try:
@@ -186,7 +185,8 @@ def get_market_price(item):
         if len(prices) < 3:
             return None
 
-        return round(sum(prices) / len(prices), 2)
+        import statistics
+return round(statistics.median(prices), 2)
 
     except Exception as e:
         print(f"Market price error: {e}")
@@ -283,14 +283,18 @@ def check(params):
     print(f"{len(new_items)} new item(s) under {MAX_PRICE}€ — analysing...")
 
     for item in new_items:
-        price = get_price(item)
-        market_price = get_market_price(item)
+    title = item.get("title", "").lower()
+    if not any(k in title for k in KEYWORDS):
+        continue
+
+    price = get_price(item)
+    market_price = get_market_price(item)
 
         if market_price:
             ratio = price / market_price
             discount = round((1 - ratio) * 100)
             print(f"  {item.get('title')} — {price:.2f}€ vs market {market_price:.2f}€ ({discount}% below)")
-            if ratio <= BELOW_MARKET_THRESHOLD:
+            if ratio <= BELOW_MARKET_THRESHOLD and discount >= 30:
                 send_alert(item, market_price)
             else:
                 print(f"  Skipped — not enough below market")
