@@ -4,9 +4,24 @@ import os
 from urllib.parse import urlparse, parse_qs
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
-VINTED_SEARCH_URL = os.environ["VINTED_SEARCH_URL"]
 MAX_PRICE = float(os.environ.get("MAX_PRICE", 30))
 CHECK_INTERVAL = 30
+
+# Load all search URLs (VINTED_SEARCH_URL_1, _2, _3, etc.)
+SEARCH_URLS = []
+i = 1
+while True:
+    url = os.environ.get(f"VINTED_SEARCH_URL_{i}")
+    if not url:
+        break
+    SEARCH_URLS.append(url)
+    i += 1
+
+# Fallback to single URL if no numbered ones found
+if not SEARCH_URLS:
+    single = os.environ.get("VINTED_SEARCH_URL")
+    if single:
+        SEARCH_URLS.append(single)
 
 VINTED_API = "https://www.vinted.fr/api/v2/catalog/items"
 
@@ -123,20 +138,24 @@ def check(params):
 
 def main():
     print("Vinted Monitor starting...")
-    print(f"Max price: {MAX_PRICE}€ — checking every {CHECK_INTERVAL}s")
+    print(f"Monitoring {len(SEARCH_URLS)} search(es) — Max price: {MAX_PRICE}€")
 
     get_session_cookie()
-    params = parse_params(VINTED_SEARCH_URL)
+
+    all_params = [parse_params(url) for url in SEARCH_URLS]
 
     print("Initial scan (no alerts)...")
-    for item in fetch_items(params):
-        if item.get("id"):
-            seen_ids.add(item["id"])
+    for params in all_params:
+        for item in fetch_items(params):
+            if item.get("id"):
+                seen_ids.add(item["id"])
     print(f"{len(seen_ids)} existing items indexed. Monitoring starts now.")
 
     while True:
         print(f"Checking... [{time.strftime('%H:%M:%S')}]")
-        check(params)
+        for params in all_params:
+            check(params)
+            time.sleep(5)
         time.sleep(CHECK_INTERVAL)
 
 
