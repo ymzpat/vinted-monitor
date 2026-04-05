@@ -1,14 +1,13 @@
+import requests
 import os
 import time
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urlparse, parse_qs
+from datetime import datetime
 
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]
-MAX_PRICE = float(os.environ.get("MAX_PRICE", 23))
-CHECK_INTERVAL = 60
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+MAX_PRICE = float(os.environ.get("MAX_PRICE", 1000))  # Optional price filter
+CHECK_INTERVAL = 60  # seconds
 
-# Collect search URLs from env vars
 SEARCH_URLS = []
 i = 1
 while True:
@@ -23,107 +22,109 @@ if not SEARCH_URLS:
     if single:
         SEARCH_URLS.append(single)
 
-print(f"Monitoring {len(SEARCH_URLS)} search URL(s)")
+parsed_base = urlparse(SEARCH_URLS[0]) if SEARCH_URLS else None
+BASE_DOMAIN = f"{parsed_base.scheme}://{parsed_base.netloc}" if parsed_base else "https://www.vinted.com"
+VINTED_API = f"{BASE_DOMAIN}/api/v2/catalog/items"
 
-seen_items = set()
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
+}
 
-def is_off_hours():
-    hour = int(time.strftime("%H", time.gmtime()))
-    return 2 <= hour < 9
+seen_ids = set()
+session = requests.Session()
 
-def send_discord_alert(title, price, url, brand=None, size=None, condition=None, image=None):
-    embed = {
-        "title": title,
-        "url": url,
-        "color": 0x09B1BA,
-        "fields": [
-            {"name": "Price", "value": f"{price}€", "inline": True},
-            {"name": "Brand", "value": brand or "—", "inline": True},
-            {"name": "Size", "value": size or "—", "inline": True},
-            {"name": "Condition", "value": condition or "—", "inline": True},
-        ],
-        "footer": {"text": "Vinted Monitor"},
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    }
-    if image:
-        embed["image"] = {"url": image}
 
-    payload = {"content": f"@here [Buy now]({url})", "embeds": [embed]}
+def get_price(item):
+    raw = item.get("price", 9999)
+    if isinstance(raw, dict):
+        return float(raw.get("amount", 9999))
+    return float(raw)
+
+
+def parse_params(url):
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    flat = {k: v[0] if len(v) == 1 else v for k, v in params.items()}
+    flat["per_page"] = "30"
+    flat["order"] = "newest_first"
+    return flat
+
+
+def fetch_items(params):
     try:
-        r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
-        r.raise_for_status()
-        print(f"Alert sent: {title} — {price}€")
-    except Exception as e:
-        print(f"Discord error: {e}")
-
-def fetch_items(url):
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        items = []
-
-        for card in soup.select("div.feed-grid__item"):
-            link_tag = card.select_one("a.item__link")
-            if not link_tag: continue
-            item_url = urljoin("https://www.vinted.com", link_tag["href"])
-            title_tag = card.select_one("h3.item__title")
-            price_tag = card.select_one("div.item__price")
-            image_tag = card.select_one("img[itemprop='image']")
-            brand_tag = card.select_one("div.item__brand")
-            size_tag = card.select_one("div.item__size")
-            condition_tag = card.select_one("div.item__condition")
-
-            if not price_tag: continue
-            try:
-                price = float(price_tag.text.replace("€", "").strip())
-            except:
-                continue
-
-            if price > MAX_PRICE: continue
-
-            item_id = item_url.split("/")[-1]
-            if item_id in seen_items: continue
-            seen_items.add(item_id)
-
-            items.append({
-                "title": title_tag.text.strip() if title_tag else "Unknown",
-                "price": price,
-                "url": item_url,
-                "image": image_tag["src"] if image_tag else None,
-                "brand": brand_tag.text.strip() if brand_tag else None,
-                "size": size_tag.text.strip() if size_tag else None,
-                "condition": condition_tag.text.strip() if condition_tag else None
-            })
-        return items
+        resp = session.get(VINTED_API, headers=HEADERS, params=params, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("items", [])
     except Exception as e:
         print(f"Error fetching items: {e}")
         return []
 
-def main():
-    print("Vinted Monitor starting...")
-    while True:
-        if is_off_hours():
-            print("Off hours (2am-9am) — sleeping...")
-            time.sleep(300)
+
+def send_alert(item):
+    price = get_price(item)
+    title = item.get("title", "Unknown")
+    item_id = item.get("id")
+    url = f"{BASE_DOMAIN}/items/{item_id}"
+
+    tags = item.get("labels") or []
+    tag_text = ", ".join(tags) if tags else "No tags"
+
+    payload = {
+        "content": f"@here [Buy now]({url})",
+        "embeds": [{
+            "title": title,
+            "url": url,
+            "color": 0xFF4500 if tags else 0x09B1BA,  # color by tag/no-tag
+            "fields": [
+                {"name": "Price", "value": f"{price:.2f}€", "inline": True},
+                {"name": "Tags", "value": tag_text, "inline": False},
+            ],
+            "footer": {"text": "Vinted Monitor"},
+            "timestamp": datetime.utcnow().isoformat()
+        }]
+    }
+
+    try:
+        r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        r.raise_for_status()
+        print(f"Alert sent: {title} — {price:.2f}€ | Tags: {tag_text}")
+    except Exception as e:
+        print(f"Error sending Discord alert: {e}")
+
+
+def check(params):
+    global seen_ids
+    items = fetch_items(params)
+    new_items = []
+
+    for item in items:
+        item_id = item.get("id")
+        if not item_id or item_id in seen_ids:
             continue
 
-        for url in SEARCH_URLS:
-            new_items = fetch_items(url)
-            if not new_items:
-                print("No new items")
-            for item in new_items:
-                send_discord_alert(
-                    title=item["title"],
-                    price=item["price"],
-                    url=item["url"],
-                    brand=item["brand"],
-                    size=item["size"],
-                    condition=item["condition"],
-                    image=item["image"]
-                )
+        price = get_price(item)
+        if price <= MAX_PRICE:
+            new_items.append(item)
+        seen_ids.add(item_id)
+
+    for item in new_items:
+        send_alert(item)
+
+    print(f"{len(new_items)} new items checked.")
+
+
+def main():
+    print("Vinted Monitor starting...")
+    print(f"Monitoring {len(SEARCH_URLS)} searches")
+    all_params = [parse_params(url) for url in SEARCH_URLS]
+
+    while True:
+        for params in all_params:
+            check(params)
+            time.sleep(5)
         time.sleep(CHECK_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
