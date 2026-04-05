@@ -1,17 +1,22 @@
-#import requests
-#import time
+import requests
+import time
 import os
+import statistics
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone
 
+# ===== CONFIG =====
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 MAX_PRICE = float(os.environ.get("MAX_PRICE", 23))
 VINTED_USERNAME = os.environ["VINTED_USERNAME"]
 VINTED_PASSWORD = os.environ["VINTED_PASSWORD"]
-CHECK_INTERVAL = 20
-BELOW_MARKET_THRESHOLD = 0.80
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", 20))
+BELOW_MARKET_THRESHOLD = float(os.environ.get("BELOW_MARKET_THRESHOLD", 0.80))
+
+# Only alert for these brands/items
 KEYWORDS = ["nike", "carhartt", "stussy", "arc'teryx"]
 
+# ===== SEARCH URLS =====
 SEARCH_URLS = []
 i = 1
 while True:
@@ -42,6 +47,7 @@ seen_ids = set()
 session = requests.Session()
 
 
+# ===== FUNCTIONS =====
 def get_price(item):
     raw = item.get("price", 9999)
     if isinstance(raw, dict):
@@ -58,35 +64,20 @@ def get_session_cookie():
 
 
 def login():
-    """Log in to Vinted and store session cookies."""
     try:
-        # First get CSRF token
         resp = session.get(f"{BASE_DOMAIN}/api/v2/sessions/csrf", headers=HEADERS, timeout=10)
         csrf = resp.json().get("csrf_token") or resp.cookies.get("CSRF-TOKEN", "")
 
         login_headers = {**HEADERS, "X-CSRF-Token": csrf, "Content-Type": "application/json"}
+        payload = {"user": {"login": VINTED_USERNAME, "password": VINTED_PASSWORD}}
 
-        payload = {
-            "user": {
-                "login": VINTED_USERNAME,
-                "password": VINTED_PASSWORD,
-            }
-        }
-
-        resp2 = session.post(
-            f"{BASE_DOMAIN}/api/v2/sessions",
-            json=payload,
-            headers=login_headers,
-            timeout=10,
-        )
-
+        resp2 = session.post(f"{BASE_DOMAIN}/api/v2/sessions", json=payload, headers=login_headers, timeout=10)
         if resp2.status_code == 200:
             print("Logged in successfully")
             return True
         else:
             print(f"Login failed: {resp2.status_code} — {resp2.text[:200]}")
             return False
-
     except Exception as e:
         print(f"Login error: {e}")
         return False
@@ -108,11 +99,15 @@ def fetch_items(params):
             resp.raise_for_status()
             return resp.json().get("items", [])
         except requests.exceptions.HTTPError:
-            print("Retrying...")
+            print("Retrying fetch_items...")
             time.sleep(2 * (attempt + 1))
             get_session_cookie()
             login()
+        except Exception as e:
+            print(f"Fetch error: {e}")
+            time.sleep(1)
     return []
+
 
 def fetch_item_details(item_id):
     try:
@@ -185,8 +180,7 @@ def get_market_price(item):
         if len(prices) < 3:
             return None
 
-        import statistics
-return round(statistics.median(prices), 2)
+        return round(statistics.median(prices), 2)
 
     except Exception as e:
         print(f"Market price error: {e}")
@@ -212,24 +206,16 @@ def send_alert(item, market_price):
     discount = round((1 - price / market_price) * 100)
     deal_line = f"🔥 **{discount}% below market** (avg {market_price:.2f}€)"
     color = 0xFF4500 if discount >= 40 else 0x09B1BA
-
-    demand_parts = []
-    if views:
-        demand_parts.append(f"👀 {views} views")
-    if favourites:
-        demand_parts.append(f"❤️ {favourites} saved")
-    if minutes_ago is not None:
-        if minutes_ago < 60:
-            demand_parts.append(f"🕐 {minutes_ago}m ago")
-        else:
-            demand_parts.append(f"🕐 {minutes_ago // 60}h ago")
-    if demand_label:
-        demand_parts.append(demand_label)
-
-    demand_line = " · ".join(demand_parts) if demand_parts else "—"
-
     if favourites >= 10:
         color = 0xFF0000
+
+    demand_parts = []
+    if views: demand_parts.append(f"👀 {views} views")
+    if favourites: demand_parts.append(f"❤️ {favourites} saved")
+    if minutes_ago is not None:
+        demand_parts.append(f"🕐 {minutes_ago}m ago" if minutes_ago < 60 else f"🕐 {minutes_ago // 60}h ago")
+    if demand_label: demand_parts.append(demand_label)
+    demand_line = " · ".join(demand_parts) if demand_parts else "—"
 
     embed = {
         "title": title,
@@ -250,10 +236,7 @@ def send_alert(item, market_price):
     if image:
         embed["image"] = {"url": image}
 
-    payload = {
-        "content": f"@here [**Buy now**]({url})",
-        "embeds": [embed],
-    }
+    payload = {"content": f"@here [**Buy now**]({url})", "embeds": [embed]}
 
     try:
         r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
@@ -281,28 +264,27 @@ def check(params):
         return
 
     print(f"{len(new_items)} new item(s) under {MAX_PRICE}€ — analysing...")
-
     for item in new_items:
-    title = item.get("title", "").lower()
-    if not any(k in title for k in KEYWORDS):
-        continue
+        # FILTER BY KEYWORDS
+        title = item.get("title", "").lower()
+        if not any(k in title for k in KEYWORDS):
+            continue
 
-    price = get_price(item)
-    market_price = get_market_price(item)
+        price = get_price(item)
+        market_price = get_market_price(item)
 
         if market_price:
             ratio = price / market_price
-            discount = round((1 - ratio) * 100)
-            print(f"  {item.get('title')} — {price:.2f}€ vs market {market_price:.2f}€ ({discount}% below)")
-            if ratio <= BELOW_MARKET_THRESHOLD and discount >= 30:
+            if ratio <= BELOW_MARKET_THRESHOLD:
                 send_alert(item, market_price)
             else:
-                print(f"  Skipped — not enough below market")
+                print(f"  Skipped {title} — not enough below market")
         else:
-            print(f"  Skipped — no market data")
+            print(f"  Skipped {title} — no market data")
 
         time.sleep(2)
 
+    # keep seen_ids manageable
     if len(seen_ids) > 5000:
         seen_ids = set(list(seen_ids)[-2000:])
 
@@ -315,12 +297,11 @@ def is_off_hours():
 def main():
     print("Vinted Monitor starting...")
     print(f"Monitoring {len(SEARCH_URLS)} search(es)")
-    print(f"Max budget: {MAX_PRICE}€ — alerting only if 20%+ below market")
+    print(f"Max budget: {MAX_PRICE}€ — alerting only if {int((1-BELOW_MARKET_THRESHOLD)*100)}%+ below market")
 
     get_session_cookie()
-    logged_in = login()
-    if not logged_in:
-        print("Warning: not logged in — demand data will be unavailable")
+    if not login():
+        print("Warning: not logged in — demand data may be missing")
 
     all_params = [parse_params(url) for url in SEARCH_URLS]
 
