@@ -2,11 +2,13 @@ import requests
 import os
 import time
 from urllib.parse import urlparse, parse_qs
-from datetime import datetime
+from datetime import datetime, timezone
 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-MAX_PRICE = float(os.environ.get("MAX_PRICE", 1000))  # Optional price filter
-CHECK_INTERVAL = 60  # seconds
+MAX_PRICE = float(os.environ.get("MAX_PRICE", 1000))
+VERY_CHEAP_THRESHOLD = float(os.environ.get("VERY_CHEAP_THRESHOLD", 20))  # items below 20€ highlighted
+POPULAR_BRANDS = os.environ.get("POPULAR_BRANDS", "Nike,Adidas").split(",")
+CHECK_INTERVAL = 60
 
 SEARCH_URLS = []
 i = 1
@@ -70,15 +72,37 @@ def send_alert(item):
     tags = item.get("labels") or []
     tag_text = ", ".join(tags) if tags else "No tags"
 
+    brand = item.get("brand_title") or "—"
+    condition = item.get("status") or "—"
+
+    # Calculate listing age
+    listed_at_ts = item.get("created_at_ts")
+    listed_text = "Unknown"
+    if listed_at_ts:
+        listed_dt = datetime.fromtimestamp(listed_at_ts, tz=timezone.utc)
+        delta = datetime.now(timezone.utc) - listed_dt
+        minutes = int(delta.total_seconds() / 60)
+        listed_text = f"{minutes}m ago" if minutes < 60 else f"{minutes//60}h ago"
+
+    # Color rules
+    color = 0x09B1BA  # default
+    if price <= VERY_CHEAP_THRESHOLD:
+        color = 0xFF4500  # very cheap
+    if brand in POPULAR_BRANDS:
+        color = 0xFFD700  # popular brand
+
     payload = {
         "content": f"@here [Buy now]({url})",
         "embeds": [{
             "title": title,
             "url": url,
-            "color": 0xFF4500 if tags else 0x09B1BA,  # color by tag/no-tag
+            "color": color,
             "fields": [
                 {"name": "Price", "value": f"{price:.2f}€", "inline": True},
+                {"name": "Brand", "value": brand, "inline": True},
+                {"name": "Condition", "value": condition, "inline": True},
                 {"name": "Tags", "value": tag_text, "inline": False},
+                {"name": "Listed", "value": listed_text, "inline": True}
             ],
             "footer": {"text": "Vinted Monitor"},
             "timestamp": datetime.utcnow().isoformat()
@@ -88,7 +112,7 @@ def send_alert(item):
     try:
         r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
         r.raise_for_status()
-        print(f"Alert sent: {title} — {price:.2f}€ | Tags: {tag_text}")
+        print(f"Alert sent: {title} — {price:.2f}€ | {brand} | {tag_text}")
     except Exception as e:
         print(f"Error sending Discord alert: {e}")
 
@@ -102,7 +126,6 @@ def check(params):
         item_id = item.get("id")
         if not item_id or item_id in seen_ids:
             continue
-
         price = get_price(item)
         if price <= MAX_PRICE:
             new_items.append(item)
