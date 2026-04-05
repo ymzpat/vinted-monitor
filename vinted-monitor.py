@@ -1,12 +1,13 @@
-#import requests
-#import time
-#import os
+import requests
+import time
+import os
 from urllib.parse import urlparse, parse_qs
+from datetime import datetime, timezone
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 MAX_PRICE = float(os.environ.get("MAX_PRICE", 23))
 CHECK_INTERVAL = 60
-BELOW_MARKET_THRESHOLD = 0.80  # alert if price is 20% or more below market average
+BELOW_MARKET_THRESHOLD = 0.80
 
 SEARCH_URLS = []
 i = 1
@@ -23,6 +24,7 @@ if not SEARCH_URLS:
         SEARCH_URLS.append(single)
 
 VINTED_API = "https://www.vinted.fr/api/v2/catalog/items"
+VINTED_ITEM_API = "https://www.vinted.fr/api/v2/items"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (HTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -73,37 +75,88 @@ def fetch_items(params):
         return []
 
 
-def get_market_price(item):
-    """Search for similar items and return the average price."""
+def fetch_item_details(item_id):
+    """Fetch full item details to get view count and favourite count."""
     try:
-        title = item.get("title", "")
-        brand = item.get("brand_title", "")
-        # Use brand + first 2 words of title as search query
-        words = (brand + " " + title).strip().split()[:4]
-        query = " ".join(words)
+        resp = session.get(f"{VINTED_ITEM_API}/{item_id}", headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        return resp.json().get("item", {})
+    except Exception as e:
+        print(f"Item detail error: {e}")
+        return {}
+
+
+def get_demand_info(item_id, listed_at):
+    """Return views, favourites, minutes since listed, and demand label."""
+    details = fetch_item_details(item_id)
+
+    views = details.get("view_count", 0) or 0
+    favourites = details.get("favourite_count", 0) or 0
+
+    # Calculate minutes since listed
+    minutes_ago = None
+    if listed_at:
+        try:
+            listed_time = datetime.fromisoformat(listed_at.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            minutes_ago = int((now - listed_time).total_seconds() / 60)
+        except Exception:
+            pass
+
+    # Demand label
+    label = None
+    if favourites >= 10:
+        label = "🔥 High demand"
+    elif favourites >= 5:
+        label = "⚡ Getting attention"
+    elif favourites >= 2 and minutes_ago and minutes_ago < 30:
+        label = "⚡ Moving fast"
+
+    return views, favourites, minutes_ago, label
+
+
+def get_market_price(item):
+    try:
+        brand_id = item.get("brand_dto", {}).get("id") or item.get("brand_id")
+        catalog_id = item.get("catalog_id")
+        status_id = item.get("status_id")
+        size_id = item.get("size_id")
+
+        if not brand_id and not catalog_id:
+            return None
 
         params = {
-            "search_text": query,
-            "per_page": "20",
+            "per_page": "30",
             "order": "relevance",
         }
+
+        if brand_id:
+            params["brand_ids[]"] = brand_id
+        if catalog_id:
+            params["catalog_ids[]"] = catalog_id
+        if status_id:
+            params["status_ids[]"] = status_id
+        if size_id:
+            params["size_ids[]"] = size_id
 
         resp = session.get(VINTED_API, headers=HEADERS, params=params, timeout=10)
         resp.raise_for_status()
         similar_items = resp.json().get("items", [])
 
-        prices = []
-        for s in similar_items:
-            p = get_price(s)
-            # Only include reasonably priced items to avoid skewing the average
-            if 1 < p < 200:
-                prices.append(p)
+        item_id = item.get("id")
+        prices = [get_price(s) for s in similar_items if s.get("id") != item_id and 1 < get_price(s) < 500]
+
+        if len(prices) < 3 and size_id:
+            params.pop("size_ids[]", None)
+            resp2 = session.get(VINTED_API, headers=HEADERS, params=params, timeout=10)
+            resp2.raise_for_status()
+            similar_items2 = resp2.json().get("items", [])
+            prices = [get_price(s) for s in similar_items2 if s.get("id") != item_id and 1 < get_price(s) < 500]
 
         if len(prices) < 3:
             return None
 
-        avg = sum(prices) / len(prices)
-        return round(avg, 2)
+        return round(sum(prices) / len(prices), 2)
 
     except Exception as e:
         print(f"Market price error: {e}")
@@ -113,29 +166,60 @@ def get_market_price(item):
 def send_alert(item, market_price=None):
     price = get_price(item)
     title = item.get("title", "Unknown item")
-    url = f"https://www.vinted.fr/items/{item['id']}"
+    item_id = item.get("id")
+    url = f"https://www.vinted.fr/items/{item_id}"
+    listed_at = item.get("created_at_ts") or item.get("updated_at_ts")
 
     photos = item.get("photos", [])
     image = photos[0].get("url") if photos else None
 
+    brand = item.get("brand_title") or "—"
+    size = item.get("size_title") or "—"
+    condition = item.get("status") or "—"
+
+    # Get demand info
+    views, favourites, minutes_ago, demand_label = get_demand_info(item_id, listed_at)
+
+    # Build deal line
     if market_price and market_price > 0:
         discount = round((1 - price / market_price) * 100)
         deal_line = f"🔥 **{discount}% below market** (avg {market_price:.2f}€)"
         color = 0xFF4500 if discount >= 40 else 0x09B1BA
     else:
-        deal_line = f"Under {MAX_PRICE}€"
+        deal_line = f"Under {MAX_PRICE}€ — no market data"
         color = 0x09B1BA
 
+    # Build demand line
+    demand_parts = []
+    if views:
+        demand_parts.append(f"👀 {views} views")
+    if favourites:
+        demand_parts.append(f"❤️ {favourites} saved")
+    if minutes_ago is not None:
+        if minutes_ago < 60:
+            demand_parts.append(f"🕐 {minutes_ago}m ago")
+        else:
+            demand_parts.append(f"🕐 {minutes_ago // 60}h ago")
+    if demand_label:
+        demand_parts.append(demand_label)
+
+    demand_line = " · ".join(demand_parts) if demand_parts else "No demand data"
+
+    # Override color if high demand
+    if favourites >= 10:
+        color = 0xFF0000
+
     embed = {
-        "title": f"{title}",
+        "title": title,
         "url": url,
         "color": color,
         "fields": [
             {"name": "Price", "value": f"**{price:.2f}€**", "inline": True},
-            {"name": "Brand", "value": item.get("brand_title") or "—", "inline": True},
-            {"name": "Size", "value": item.get("size_title") or "—", "inline": True},
-            {"name": "Condition", "value": item.get("status") or "—", "inline": True},
+            {"name": "Brand", "value": brand, "inline": True},
+            {"name": "Size", "value": size, "inline": True},
+            {"name": "Condition", "value": condition, "inline": True},
             {"name": "Deal", "value": deal_line, "inline": False},
+            {"name": "Demand", "value": demand_line, "inline": False},
         ],
         "footer": {"text": "Vinted Monitor"},
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -152,7 +236,7 @@ def send_alert(item, market_price=None):
     try:
         r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
         r.raise_for_status()
-        print(f"Alert sent: {title} — {price:.2f}€")
+        print(f"Alert sent: {title} — {price:.2f}€ | {favourites} saves | {views} views")
     except Exception as e:
         print(f"Discord error: {e}")
 
@@ -174,7 +258,7 @@ def check(params):
         print("No new items")
         return
 
-    print(f"{len(new_items)} new item(s) under {MAX_PRICE}€ — checking market price...")
+    print(f"{len(new_items)} new item(s) under {MAX_PRICE}€ — analysing...")
 
     for item in new_items:
         price = get_price(item)
@@ -182,24 +266,23 @@ def check(params):
 
         if market_price:
             ratio = price / market_price
-            print(f"  {item.get('title')} — {price:.2f}€ vs market {market_price:.2f}€ (ratio {ratio:.2f})")
+            discount = round((1 - ratio) * 100)
+            print(f"  {item.get('title')} — {price:.2f}€ vs market {market_price:.2f}€ ({discount}% below)")
             if ratio <= BELOW_MARKET_THRESHOLD:
                 send_alert(item, market_price)
             else:
                 print(f"  Skipped — not enough below market")
         else:
-            # Not enough data to compare — alert anyway since it's under budget
             print(f"  No market data — alerting anyway")
             send_alert(item, None)
 
-        time.sleep(2)  # small pause between market price checks
+        time.sleep(2)
 
     if len(seen_ids) > 5000:
         seen_ids = set(list(seen_ids)[-2000:])
 
 
 def is_off_hours():
-    """Returns True between 2am and 9am — pause to save Railway credits."""
     hour = int(time.strftime("%H", time.gmtime()))
     return 2 <= hour < 9
 
