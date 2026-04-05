@@ -1,11 +1,13 @@
 import requests
 import time
-#import os
-#from urllib.parse import urlparse, parse_qs
+import os
+from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 MAX_PRICE = float(os.environ.get("MAX_PRICE", 23))
+VINTED_USERNAME = os.environ["VINTED_USERNAME"]
+VINTED_PASSWORD = os.environ["VINTED_PASSWORD"]
 CHECK_INTERVAL = 60
 BELOW_MARKET_THRESHOLD = 0.80
 
@@ -23,13 +25,10 @@ if not SEARCH_URLS:
     if single:
         SEARCH_URLS.append(single)
 
-# Auto-detect base domain from first search URL
 parsed_base = urlparse(SEARCH_URLS[0]) if SEARCH_URLS else None
 BASE_DOMAIN = f"{parsed_base.scheme}://{parsed_base.netloc}" if parsed_base else "https://www.vinted.fr"
 VINTED_API = f"{BASE_DOMAIN}/api/v2/catalog/items"
 VINTED_ITEM_API = f"{BASE_DOMAIN}/api/v2/items"
-
-print(f"Using domain: {BASE_DOMAIN}")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (HTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -57,6 +56,41 @@ def get_session_cookie():
         print(f"Could not get session cookie: {e}")
 
 
+def login():
+    """Log in to Vinted and store session cookies."""
+    try:
+        # First get CSRF token
+        resp = session.get(f"{BASE_DOMAIN}/api/v2/sessions/csrf", headers=HEADERS, timeout=10)
+        csrf = resp.json().get("csrf_token") or resp.cookies.get("CSRF-TOKEN", "")
+
+        login_headers = {**HEADERS, "X-CSRF-Token": csrf, "Content-Type": "application/json"}
+
+        payload = {
+            "user": {
+                "login": VINTED_USERNAME,
+                "password": VINTED_PASSWORD,
+            }
+        }
+
+        resp2 = session.post(
+            f"{BASE_DOMAIN}/api/v2/sessions",
+            json=payload,
+            headers=login_headers,
+            timeout=10,
+        )
+
+        if resp2.status_code == 200:
+            print("Logged in successfully")
+            return True
+        else:
+            print(f"Login failed: {resp2.status_code} — {resp2.text[:200]}")
+            return False
+
+    except Exception as e:
+        print(f"Login error: {e}")
+        return False
+
+
 def parse_params(url):
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
@@ -74,6 +108,7 @@ def fetch_items(params):
     except requests.exceptions.HTTPError as e:
         print(f"HTTP error: {e} — refreshing session")
         get_session_cookie()
+        login()
         return []
     except Exception as e:
         print(f"Fetch error: {e}")
@@ -158,7 +193,7 @@ def get_market_price(item):
         return None
 
 
-def send_alert(item, market_price=None):
+def send_alert(item, market_price):
     price = get_price(item)
     title = item.get("title", "Unknown item")
     item_id = item.get("id")
@@ -174,13 +209,9 @@ def send_alert(item, market_price=None):
 
     views, favourites, minutes_ago, demand_label = get_demand_info(item_id, listed_at)
 
-    if market_price and market_price > 0:
-        discount = round((1 - price / market_price) * 100)
-        deal_line = f"🔥 **{discount}% below market** (avg {market_price:.2f}€)"
-        color = 0xFF4500 if discount >= 40 else 0x09B1BA
-    else:
-        deal_line = f"Under {MAX_PRICE}€ — no market data"
-        color = 0x09B1BA
+    discount = round((1 - price / market_price) * 100)
+    deal_line = f"🔥 **{discount}% below market** (avg {market_price:.2f}€)"
+    color = 0xFF4500 if discount >= 40 else 0x09B1BA
 
     demand_parts = []
     if views:
@@ -227,7 +258,7 @@ def send_alert(item, market_price=None):
     try:
         r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
         r.raise_for_status()
-        print(f"Alert sent: {title} — {price:.2f}€ | ❤️ {favourites} | 👀 {views}")
+        print(f"Alert sent: {title} — {price:.2f}€ | ❤️ {favourites} | 👀 {views} | {discount}% below market")
     except Exception as e:
         print(f"Discord error: {e}")
 
@@ -264,8 +295,7 @@ def check(params):
             else:
                 print(f"  Skipped — not enough below market")
         else:
-            print(f"  No market data — alerting anyway")
-            send_alert(item, None)
+            print(f"  Skipped — no market data")
 
         time.sleep(2)
 
@@ -281,9 +311,13 @@ def is_off_hours():
 def main():
     print("Vinted Monitor starting...")
     print(f"Monitoring {len(SEARCH_URLS)} search(es)")
-    print(f"Max budget: {MAX_PRICE}€ — alerting if 20%+ below market")
+    print(f"Max budget: {MAX_PRICE}€ — alerting only if 20%+ below market")
 
     get_session_cookie()
+    logged_in = login()
+    if not logged_in:
+        print("Warning: not logged in — demand data will be unavailable")
+
     all_params = [parse_params(url) for url in SEARCH_URLS]
 
     print("Initial scan (no alerts)...")
