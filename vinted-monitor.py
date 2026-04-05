@@ -1,7 +1,7 @@
 import requests
 import time
-import os
-from urllib.parse import urlparse, parse_qs
+#import os
+#from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
