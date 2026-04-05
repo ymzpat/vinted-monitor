@@ -1,7 +1,7 @@
-import requests
-import time
-import os
-from urllib.parse import urlparse, parse_qs
+### import requests
+# import time
+# import os
+### from urllib.parse import urlparse, parse_qs
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 MAX_PRICE = float(os.environ.get("MAX_PRICE", 30))
