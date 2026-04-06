@@ -1,7 +1,7 @@
 import requests
-#import time
-# import os
-#from urllib.parse import urlparse, parse_qs
+import time
+import os
+from urllib.parse import urlparse, parse_qs
 
 MAX_PRICE = float(os.environ.get("MAX_PRICE", 23))
 CHECK_INTERVAL = 60
@@ -37,8 +37,6 @@ HEADERS = {
 
 seen_ids = set()
 session = requests.Session()
-
-# Keys to strip from search URL before sending to API
 STRIP_PARAMS = {"page", "time", "search_by_image_uuid", "search_by_image_id"}
 
 
@@ -58,7 +56,6 @@ def get_session_cookie():
 
 
 def parse_params(url):
-    """Parse URL params, strip junk, keep lists as lists."""
     parsed = urlparse(url)
     raw = parse_qs(parsed.query)
     params = {}
@@ -86,24 +83,20 @@ def fetch_items(params):
 
 
 def get_market_price(item):
-    """
-    Search for comparable items using brand, catalog, condition.
-    Uses all brand_ids from the item if available.
-    """
     try:
         brand_id = item.get("brand_dto", {}).get("id") or item.get("brand_id")
         catalog_id = item.get("catalog_id")
         status_id = item.get("status_id")
         size_id = item.get("size_id")
 
+        print(f"    [market] brand_id={brand_id} catalog_id={catalog_id} status_id={status_id} size_id={size_id}")
+
         if not brand_id and not catalog_id:
+            print(f"    [market] no brand or catalog — skipping")
             return None
 
-        # Build params as list of tuples to support multiple values
-        params = [
-            ("per_page", "30"),
-            ("order", "relevance"),
-        ]
+        # Attempt 1: brand + catalog + condition + size
+        params = [("per_page", "30"), ("order", "relevance")]
         if brand_id:
             params.append(("brand_ids[]", brand_id))
         if catalog_id:
@@ -115,33 +108,40 @@ def get_market_price(item):
 
         resp = session.get(VINTED_API, headers=HEADERS, params=params, timeout=10)
         resp.raise_for_status()
-        similar = resp.json().get("items", [])
+        data = resp.json()
+        similar = data.get("items", [])
         item_id = item.get("id")
         prices = [get_price(s) for s in similar if s.get("id") != item_id and 1 < get_price(s) < 500]
+        print(f"    [market] attempt 1: {len(similar)} results, {len(prices)} valid prices")
 
-        # Retry without size if not enough results
+        # Attempt 2: drop size
         if len(prices) < 2 and size_id:
             params2 = [(k, v) for k, v in params if k != "size_ids[]"]
             resp2 = session.get(VINTED_API, headers=HEADERS, params=params2, timeout=10)
             resp2.raise_for_status()
             similar2 = resp2.json().get("items", [])
             prices = [get_price(s) for s in similar2 if s.get("id") != item_id and 1 < get_price(s) < 500]
+            print(f"    [market] attempt 2 (no size): {len(similar2)} results, {len(prices)} valid prices")
 
-        # Retry with just catalog if still not enough
+        # Attempt 3: just catalog
         if len(prices) < 2 and catalog_id:
             params3 = [("per_page", "30"), ("order", "relevance"), ("catalog_ids[]", catalog_id)]
             resp3 = session.get(VINTED_API, headers=HEADERS, params=params3, timeout=10)
             resp3.raise_for_status()
             similar3 = resp3.json().get("items", [])
             prices = [get_price(s) for s in similar3 if s.get("id") != item_id and 1 < get_price(s) < 500]
+            print(f"    [market] attempt 3 (catalog only): {len(similar3)} results, {len(prices)} valid prices")
 
         if not prices:
+            print(f"    [market] no prices found across all attempts")
             return None
 
-        return round(sum(prices) / len(prices), 2)
+        avg = round(sum(prices) / len(prices), 2)
+        print(f"    [market] avg price: {avg}€ from {len(prices)} items")
+        return avg
 
     except Exception as e:
-        print(f"Market price error: {e}")
+        print(f"    [market] error: {e}")
         return None
 
 
@@ -215,22 +215,21 @@ def check(search):
         print(f"Search {search['index']}: No new items")
         return
 
-    print(f"Search {search['index']}: {len(new_items)} new item(s) under {MAX_PRICE}€ — checking market price...")
+    print(f"Search {search['index']}: {len(new_items)} new item(s) under {MAX_PRICE}€")
 
     for item in new_items:
         price = get_price(item)
+        print(f"  Checking: {item.get('title')} — {price:.2f}€")
         market_price = get_market_price(item)
 
         if market_price:
             ratio = price / market_price
             discount = round((1 - ratio) * 100)
-            print(f"  {item.get('title')} — {price:.2f}€ vs market {market_price:.2f}€ ({discount}% below)")
             if ratio <= BELOW_MARKET_THRESHOLD:
                 send_alert(item, webhook_url, market_price)
             else:
-                print(f"  Skipped — not enough below market")
+                print(f"  Skipped — only {discount}% below market (need 20%+)")
         else:
-            print(f"  No market data — alerting anyway")
             send_alert(item, webhook_url, None)
 
         time.sleep(2)
