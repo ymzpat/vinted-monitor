@@ -1,29 +1,23 @@
-#import requests
-#import time
-#import os
+import requests
+import time
+import os
 from urllib.parse import urlparse, parse_qs
 
 MAX_PRICE = float(os.environ.get("MAX_PRICE", 23))
 CHECK_INTERVAL = 60
 BELOW_MARKET_THRESHOLD = 0.80
 
-# Load search URLs and their matching webhooks
-# VINTED_SEARCH_URL_1 pairs with WEBHOOK_URL_1, etc.
 SEARCHES = []
 i = 1
 while True:
     url = os.environ.get(f"VINTED_SEARCH_URL_{i}")
-    webhook = os.environ.get(f"WEBHOOK_URL_{i}")
+    webhook = os.environ.get(f"WEBHOOK_URL_{i}") or os.environ.get("WEBHOOK_URL")
     if not url:
         break
-    if not webhook:
-        # Fall back to default webhook if no specific one set
-        webhook = os.environ.get("WEBHOOK_URL")
     if webhook:
         SEARCHES.append({"url": url, "webhook": webhook, "index": i})
     i += 1
 
-# Fallback to single URL + single webhook
 if not SEARCHES:
     url = os.environ.get("VINTED_SEARCH_URL")
     webhook = os.environ.get("WEBHOOK_URL")
@@ -44,6 +38,9 @@ HEADERS = {
 seen_ids = set()
 session = requests.Session()
 
+# Keys to strip from search URL before sending to API
+STRIP_PARAMS = {"page", "time", "search_by_image_uuid", "search_by_image_id"}
+
 
 def get_price(item):
     raw = item.get("price", 9999)
@@ -61,12 +58,17 @@ def get_session_cookie():
 
 
 def parse_params(url):
+    """Parse URL params, strip junk, keep lists as lists."""
     parsed = urlparse(url)
-    params = parse_qs(parsed.query)
-    flat = {k: v[0] if len(v) == 1 else v for k, v in params.items()}
-    flat["per_page"] = "30"
-    flat["order"] = "newest_first"
-    return flat
+    raw = parse_qs(parsed.query)
+    params = {}
+    for k, v in raw.items():
+        if k in STRIP_PARAMS:
+            continue
+        params[k] = v if len(v) > 1 else v[0]
+    params["per_page"] = "30"
+    params["order"] = "newest_first"
+    return params
 
 
 def fetch_items(params):
@@ -84,6 +86,10 @@ def fetch_items(params):
 
 
 def get_market_price(item):
+    """
+    Search for comparable items using brand, catalog, condition.
+    Uses all brand_ids from the item if available.
+    """
     try:
         brand_id = item.get("brand_dto", {}).get("id") or item.get("brand_id")
         catalog_id = item.get("catalog_id")
@@ -93,15 +99,19 @@ def get_market_price(item):
         if not brand_id and not catalog_id:
             return None
 
-        params = {"per_page": "30", "order": "relevance"}
+        # Build params as list of tuples to support multiple values
+        params = [
+            ("per_page", "30"),
+            ("order", "relevance"),
+        ]
         if brand_id:
-            params["brand_ids[]"] = brand_id
+            params.append(("brand_ids[]", brand_id))
         if catalog_id:
-            params["catalog_ids[]"] = catalog_id
+            params.append(("catalog_ids[]", catalog_id))
         if status_id:
-            params["status_ids[]"] = status_id
+            params.append(("status_ids[]", status_id))
         if size_id:
-            params["size_ids[]"] = size_id
+            params.append(("size_ids[]", size_id))
 
         resp = session.get(VINTED_API, headers=HEADERS, params=params, timeout=10)
         resp.raise_for_status()
@@ -109,14 +119,23 @@ def get_market_price(item):
         item_id = item.get("id")
         prices = [get_price(s) for s in similar if s.get("id") != item_id and 1 < get_price(s) < 500]
 
-        if len(prices) < 1 and size_id:
-            params.pop("size_ids[]", None)
-            resp2 = session.get(VINTED_API, headers=HEADERS, params=params, timeout=10)
+        # Retry without size if not enough results
+        if len(prices) < 2 and size_id:
+            params2 = [(k, v) for k, v in params if k != "size_ids[]"]
+            resp2 = session.get(VINTED_API, headers=HEADERS, params=params2, timeout=10)
             resp2.raise_for_status()
             similar2 = resp2.json().get("items", [])
             prices = [get_price(s) for s in similar2 if s.get("id") != item_id and 1 < get_price(s) < 500]
 
-        if len(prices) < 1:
+        # Retry with just catalog if still not enough
+        if len(prices) < 2 and catalog_id:
+            params3 = [("per_page", "30"), ("order", "relevance"), ("catalog_ids[]", catalog_id)]
+            resp3 = session.get(VINTED_API, headers=HEADERS, params=params3, timeout=10)
+            resp3.raise_for_status()
+            similar3 = resp3.json().get("items", [])
+            prices = [get_price(s) for s in similar3 if s.get("id") != item_id and 1 < get_price(s) < 500]
+
+        if not prices:
             return None
 
         return round(sum(prices) / len(prices), 2)
@@ -170,7 +189,6 @@ def send_alert(item, webhook_url, market_price=None):
         r = requests.post(webhook_url, json=payload, timeout=10)
         r.raise_for_status()
         if market_price:
-            discount = round((1 - price / market_price) * 100)
             print(f"Alert sent: {title} — {price:.2f}€ | {discount}% below market")
         else:
             print(f"Alert sent: {title} — {price:.2f}€ | no market data")
@@ -231,8 +249,6 @@ def main():
     print(f"Using domain: {BASE_DOMAIN}")
     print(f"Monitoring {len(SEARCHES)} search(es)")
     print(f"Max budget: {MAX_PRICE}€")
-    for s in SEARCHES:
-        print(f"  Search {s['index']}: {s['url'][:60]}...")
 
     get_session_cookie()
 
