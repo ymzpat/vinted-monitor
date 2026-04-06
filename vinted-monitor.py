@@ -1,28 +1,36 @@
-# import requests
-#import time
-# import os
+import requests
+import time
+import os
 from urllib.parse import urlparse, parse_qs
 
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 MAX_PRICE = float(os.environ.get("MAX_PRICE", 23))
 CHECK_INTERVAL = 60
 BELOW_MARKET_THRESHOLD = 0.80
 
-SEARCH_URLS = []
+# Load search URLs and their matching webhooks
+# VINTED_SEARCH_URL_1 pairs with WEBHOOK_URL_1, etc.
+SEARCHES = []
 i = 1
 while True:
     url = os.environ.get(f"VINTED_SEARCH_URL_{i}")
+    webhook = os.environ.get(f"WEBHOOK_URL_{i}")
     if not url:
         break
-    SEARCH_URLS.append(url)
+    if not webhook:
+        # Fall back to default webhook if no specific one set
+        webhook = os.environ.get("WEBHOOK_URL")
+    if webhook:
+        SEARCHES.append({"url": url, "webhook": webhook, "index": i})
     i += 1
 
-if not SEARCH_URLS:
-    single = os.environ.get("VINTED_SEARCH_URL")
-    if single:
-        SEARCH_URLS.append(single)
+# Fallback to single URL + single webhook
+if not SEARCHES:
+    url = os.environ.get("VINTED_SEARCH_URL")
+    webhook = os.environ.get("WEBHOOK_URL")
+    if url and webhook:
+        SEARCHES.append({"url": url, "webhook": webhook, "index": 1})
 
-parsed_base = urlparse(SEARCH_URLS[0]) if SEARCH_URLS else None
+parsed_base = urlparse(SEARCHES[0]["url"]) if SEARCHES else None
 BASE_DOMAIN = f"{parsed_base.scheme}://{parsed_base.netloc}" if parsed_base else "https://www.vinted.fr"
 VINTED_API = f"{BASE_DOMAIN}/api/v2/catalog/items"
 
@@ -101,14 +109,14 @@ def get_market_price(item):
         item_id = item.get("id")
         prices = [get_price(s) for s in similar if s.get("id") != item_id and 1 < get_price(s) < 500]
 
-        if len(prices) < 3 and size_id:
+        if len(prices) < 1 and size_id:
             params.pop("size_ids[]", None)
             resp2 = session.get(VINTED_API, headers=HEADERS, params=params, timeout=10)
             resp2.raise_for_status()
             similar2 = resp2.json().get("items", [])
             prices = [get_price(s) for s in similar2 if s.get("id") != item_id and 1 < get_price(s) < 500]
 
-        if len(prices) < 3:
+        if len(prices) < 1:
             return None
 
         return round(sum(prices) / len(prices), 2)
@@ -118,7 +126,7 @@ def get_market_price(item):
         return None
 
 
-def send_alert(item, market_price=None):
+def send_alert(item, webhook_url, market_price=None):
     price = get_price(item)
     title = item.get("title", "Unknown item")
     item_id = item.get("id")
@@ -159,9 +167,10 @@ def send_alert(item, market_price=None):
     }
 
     try:
-        r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        r = requests.post(webhook_url, json=payload, timeout=10)
         r.raise_for_status()
         if market_price:
+            discount = round((1 - price / market_price) * 100)
             print(f"Alert sent: {title} — {price:.2f}€ | {discount}% below market")
         else:
             print(f"Alert sent: {title} — {price:.2f}€ | no market data")
@@ -169,8 +178,10 @@ def send_alert(item, market_price=None):
         print(f"Discord error: {e}")
 
 
-def check(params):
+def check(search):
     global seen_ids
+    params = parse_params(search["url"])
+    webhook_url = search["webhook"]
     items = fetch_items(params)
     new_items = []
 
@@ -183,10 +194,10 @@ def check(params):
             seen_ids.add(item_id)
 
     if not new_items:
-        print("No new items")
+        print(f"Search {search['index']}: No new items")
         return
 
-    print(f"{len(new_items)} new item(s) under {MAX_PRICE}€ — checking market price...")
+    print(f"Search {search['index']}: {len(new_items)} new item(s) under {MAX_PRICE}€ — checking market price...")
 
     for item in new_items:
         price = get_price(item)
@@ -197,13 +208,12 @@ def check(params):
             discount = round((1 - ratio) * 100)
             print(f"  {item.get('title')} — {price:.2f}€ vs market {market_price:.2f}€ ({discount}% below)")
             if ratio <= BELOW_MARKET_THRESHOLD:
-                send_alert(item, market_price)
+                send_alert(item, webhook_url, market_price)
             else:
                 print(f"  Skipped — not enough below market")
         else:
-            # No market data — alert anyway so you don't miss anything
             print(f"  No market data — alerting anyway")
-            send_alert(item, None)
+            send_alert(item, webhook_url, None)
 
         time.sleep(2)
 
@@ -219,14 +229,16 @@ def is_off_hours():
 def main():
     print("Vinted Monitor starting...")
     print(f"Using domain: {BASE_DOMAIN}")
-    print(f"Monitoring {len(SEARCH_URLS)} search(es)")
+    print(f"Monitoring {len(SEARCHES)} search(es)")
     print(f"Max budget: {MAX_PRICE}€")
+    for s in SEARCHES:
+        print(f"  Search {s['index']}: {s['url'][:60]}...")
 
     get_session_cookie()
-    all_params = [parse_params(url) for url in SEARCH_URLS]
 
     print("Initial scan (no alerts)...")
-    for params in all_params:
+    for search in SEARCHES:
+        params = parse_params(search["url"])
         for item in fetch_items(params):
             if item.get("id"):
                 seen_ids.add(item["id"])
@@ -239,8 +251,8 @@ def main():
             continue
 
         print(f"Checking... [{time.strftime('%H:%M:%S')}]")
-        for params in all_params:
-            check(params)
+        for search in SEARCHES:
+            check(search)
             time.sleep(5)
         time.sleep(CHECK_INTERVAL)
 
