@@ -118,7 +118,7 @@ def get_market_price(item):
         return None
 
 
-def send_alert(item, market_price):
+def send_alert(item, market_price=None):
     price = get_price(item)
     title = item.get("title", "Unknown item")
     item_id = item.get("id")
@@ -127,8 +127,13 @@ def send_alert(item, market_price):
     photos = item.get("photos", [])
     image = photos[0].get("url") if photos else None
 
-    discount = round((1 - price / market_price) * 100)
-    color = 0xFF4500 if discount >= 40 else 0x09B1BA
+    if market_price:
+        discount = round((1 - price / market_price) * 100)
+        deal_line = f"🔥 **{discount}% below market** (avg {market_price:.2f}€)"
+        color = 0xFF4500 if discount >= 40 else 0x09B1BA
+    else:
+        deal_line = "No market data"
+        color = 0x09B1BA
 
     embed = {
         "title": title,
@@ -139,7 +144,7 @@ def send_alert(item, market_price):
             {"name": "Brand", "value": item.get("brand_title") or "—", "inline": True},
             {"name": "Size", "value": item.get("size_title") or "—", "inline": True},
             {"name": "Condition", "value": item.get("status") or "—", "inline": True},
-            {"name": "Deal", "value": f"🔥 **{discount}% below market** (avg {market_price:.2f}€)", "inline": False},
+            {"name": "Deal", "value": deal_line, "inline": False},
         ],
         "footer": {"text": "Vinted Monitor"},
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -156,7 +161,10 @@ def send_alert(item, market_price):
     try:
         r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
         r.raise_for_status()
-        print(f"Alert sent: {title} — {price:.2f}€ | {discount}% below market")
+        if market_price:
+            print(f"Alert sent: {title} — {price:.2f}€ | {discount}% below market")
+        else:
+            print(f"Alert sent: {title} — {price:.2f}€ | no market data")
     except Exception as e:
         print(f"Discord error: {e}")
 
@@ -193,7 +201,9 @@ def check(params):
             else:
                 print(f"  Skipped — not enough below market")
         else:
-            print(f"  Skipped — no market data")
+            # No market data — alert anyway so you don't miss anything
+            print(f"  No market data — alerting anyway")
+            send_alert(item, None)
 
         time.sleep(2)
 
@@ -210,7 +220,7 @@ def main():
     print("Vinted Monitor starting...")
     print(f"Using domain: {BASE_DOMAIN}")
     print(f"Monitoring {len(SEARCH_URLS)} search(es)")
-    print(f"Max budget: {MAX_PRICE}€ — alerting only if 20%+ below market")
+    print(f"Max budget: {MAX_PRICE}€")
 
     get_session_cookie()
     all_params = [parse_params(url) for url in SEARCH_URLS]
