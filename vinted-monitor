@@ -2,12 +2,9 @@ import requests
 import time
 import os
 from urllib.parse import urlparse, parse_qs
-from datetime import datetime, timezone
 
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 MAX_PRICE = float(os.environ.get("MAX_PRICE", 23))
-VINTED_USERNAME = os.environ["VINTED_USERNAME"]
-VINTED_PASSWORD = os.environ["VINTED_PASSWORD"]
 CHECK_INTERVAL = 60
 BELOW_MARKET_THRESHOLD = 0.80
 
@@ -28,7 +25,6 @@ if not SEARCH_URLS:
 parsed_base = urlparse(SEARCH_URLS[0]) if SEARCH_URLS else None
 BASE_DOMAIN = f"{parsed_base.scheme}://{parsed_base.netloc}" if parsed_base else "https://www.vinted.fr"
 VINTED_API = f"{BASE_DOMAIN}/api/v2/catalog/items"
-VINTED_ITEM_API = f"{BASE_DOMAIN}/api/v2/items"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (HTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -56,41 +52,6 @@ def get_session_cookie():
         print(f"Could not get session cookie: {e}")
 
 
-def login():
-    """Log in to Vinted and store session cookies."""
-    try:
-        # First get CSRF token
-        resp = session.get(f"{BASE_DOMAIN}/api/v2/sessions/csrf", headers=HEADERS, timeout=10)
-        csrf = resp.json().get("csrf_token") or resp.cookies.get("CSRF-TOKEN", "")
-
-        login_headers = {**HEADERS, "X-CSRF-Token": csrf, "Content-Type": "application/json"}
-
-        payload = {
-            "user": {
-                "login": VINTED_USERNAME,
-                "password": VINTED_PASSWORD,
-            }
-        }
-
-        resp2 = session.post(
-            f"{BASE_DOMAIN}/api/v2/sessions",
-            json=payload,
-            headers=login_headers,
-            timeout=10,
-        )
-
-        if resp2.status_code == 200:
-            print("Logged in successfully")
-            return True
-        else:
-            print(f"Login failed: {resp2.status_code} — {resp2.text[:200]}")
-            return False
-
-    except Exception as e:
-        print(f"Login error: {e}")
-        return False
-
-
 def parse_params(url):
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
@@ -108,46 +69,10 @@ def fetch_items(params):
     except requests.exceptions.HTTPError as e:
         print(f"HTTP error: {e} — refreshing session")
         get_session_cookie()
-        login()
         return []
     except Exception as e:
         print(f"Fetch error: {e}")
         return []
-
-
-def fetch_item_details(item_id):
-    try:
-        resp = session.get(f"{VINTED_ITEM_API}/{item_id}", headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-        return resp.json().get("item", {})
-    except Exception as e:
-        print(f"Item detail error: {e}")
-        return {}
-
-
-def get_demand_info(item_id, listed_at):
-    details = fetch_item_details(item_id)
-    views = details.get("view_count", 0) or 0
-    favourites = details.get("favourite_count", 0) or 0
-
-    minutes_ago = None
-    if listed_at:
-        try:
-            listed_time = datetime.fromisoformat(str(listed_at).replace("Z", "+00:00"))
-            now = datetime.now(timezone.utc)
-            minutes_ago = int((now - listed_time).total_seconds() / 60)
-        except Exception:
-            pass
-
-    label = None
-    if favourites >= 10:
-        label = "🔥 High demand"
-    elif favourites >= 5:
-        label = "⚡ Getting attention"
-    elif favourites >= 2 and minutes_ago and minutes_ago < 30:
-        label = "⚡ Moving fast"
-
-    return views, favourites, minutes_ago, label
 
 
 def get_market_price(item):
@@ -198,38 +123,12 @@ def send_alert(item, market_price):
     title = item.get("title", "Unknown item")
     item_id = item.get("id")
     url = f"{BASE_DOMAIN}/items/{item_id}"
-    listed_at = item.get("created_at_ts") or item.get("updated_at_ts")
 
     photos = item.get("photos", [])
     image = photos[0].get("url") if photos else None
 
-    brand = item.get("brand_title") or "—"
-    size = item.get("size_title") or "—"
-    condition = item.get("status") or "—"
-
-    views, favourites, minutes_ago, demand_label = get_demand_info(item_id, listed_at)
-
     discount = round((1 - price / market_price) * 100)
-    deal_line = f"🔥 **{discount}% below market** (avg {market_price:.2f}€)"
     color = 0xFF4500 if discount >= 40 else 0x09B1BA
-
-    demand_parts = []
-    if views:
-        demand_parts.append(f"👀 {views} views")
-    if favourites:
-        demand_parts.append(f"❤️ {favourites} saved")
-    if minutes_ago is not None:
-        if minutes_ago < 60:
-            demand_parts.append(f"🕐 {minutes_ago}m ago")
-        else:
-            demand_parts.append(f"🕐 {minutes_ago // 60}h ago")
-    if demand_label:
-        demand_parts.append(demand_label)
-
-    demand_line = " · ".join(demand_parts) if demand_parts else "—"
-
-    if favourites >= 10:
-        color = 0xFF0000
 
     embed = {
         "title": title,
@@ -237,11 +136,10 @@ def send_alert(item, market_price):
         "color": color,
         "fields": [
             {"name": "Price", "value": f"**{price:.2f}€**", "inline": True},
-            {"name": "Brand", "value": brand, "inline": True},
-            {"name": "Size", "value": size, "inline": True},
-            {"name": "Condition", "value": condition, "inline": True},
-            {"name": "Deal", "value": deal_line, "inline": False},
-            {"name": "Demand", "value": demand_line, "inline": False},
+            {"name": "Brand", "value": item.get("brand_title") or "—", "inline": True},
+            {"name": "Size", "value": item.get("size_title") or "—", "inline": True},
+            {"name": "Condition", "value": item.get("status") or "—", "inline": True},
+            {"name": "Deal", "value": f"🔥 **{discount}% below market** (avg {market_price:.2f}€)", "inline": False},
         ],
         "footer": {"text": "Vinted Monitor"},
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -258,7 +156,7 @@ def send_alert(item, market_price):
     try:
         r = requests.post(WEBHOOK_URL, json=payload, timeout=10)
         r.raise_for_status()
-        print(f"Alert sent: {title} — {price:.2f}€ | ❤️ {favourites} | 👀 {views} | {discount}% below market")
+        print(f"Alert sent: {title} — {price:.2f}€ | {discount}% below market")
     except Exception as e:
         print(f"Discord error: {e}")
 
@@ -280,7 +178,7 @@ def check(params):
         print("No new items")
         return
 
-    print(f"{len(new_items)} new item(s) under {MAX_PRICE}€ — analysing...")
+    print(f"{len(new_items)} new item(s) under {MAX_PRICE}€ — checking market price...")
 
     for item in new_items:
         price = get_price(item)
@@ -310,14 +208,11 @@ def is_off_hours():
 
 def main():
     print("Vinted Monitor starting...")
+    print(f"Using domain: {BASE_DOMAIN}")
     print(f"Monitoring {len(SEARCH_URLS)} search(es)")
     print(f"Max budget: {MAX_PRICE}€ — alerting only if 20%+ below market")
 
     get_session_cookie()
-    logged_in = login()
-    if not logged_in:
-        print("Warning: not logged in — demand data will be unavailable")
-
     all_params = [parse_params(url) for url in SEARCH_URLS]
 
     print("Initial scan (no alerts)...")
