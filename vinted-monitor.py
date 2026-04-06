@@ -1,6 +1,6 @@
-#import requests
-#import time
-#import os
+import requests
+import time
+import os
 from urllib.parse import urlparse, parse_qs
 
 MAX_PRICE = float(os.environ.get("MAX_PRICE", 23))
